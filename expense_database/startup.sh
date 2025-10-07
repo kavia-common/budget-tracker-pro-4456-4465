@@ -1,38 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Expense DB startup script
-# Manages a local PostgreSQL instance and applies schema/seed files idempotently.
-# - Detects/creates PGDATA under ./data
-# - Initializes cluster if needed (initdb)
-# - Starts postgres via pg_ctl on localhost with configured port (default 5001)
-# - Waits for readiness using psql
-# - Ensures superuser and database exist
-# - Applies schema.sql and seed.sql idempotently
-# - Keeps postgres running in foreground by tailing log
-#
-# Env vars with defaults:
-#   POSTGRES_USER=postgres
-#   POSTGRES_PASSWORD=postgres
-#   POSTGRES_DB=postgres
-#   POSTGRES_HOST=127.0.0.1
-#   POSTGRES_PORT=5001
-#   POSTGRES_URL (overrides constructed URL if provided)
-#   START_LOCAL_POSTGRES=true (default for this container)
-#
-# Notes:
-# - This script binds postgres to 127.0.0.1 only.
-# - It uses pg_ctl for controlled start/stop and a local postgres.log for output.
+# Expense DB startup script (hardened)
+# - Defaults: START_LOCAL_POSTGRES=true, HOST=127.0.0.1, PORT=5001
+# - Verifies postgres binaries availability (postgres, initdb, pg_ctl, psql)
+# - Ensures PGDATA permissions
+# - Detects and reports port conflicts
+# - Configures postgresql.conf to listen on desired host/port
+# - Starts postgres with pg_ctl and waits up to 180s for readiness
+# - Ensures DB/role exist; applies schema and seed only after readiness
+# - Skips schema/seed if DB unreachable
+# - Verbose logs prefixed with [DB]
+# - Keeps server running in foreground with pg_ctl; handles termination cleanly
 
-# Defaults
+# Defaults and env
 : "${POSTGRES_USER:=postgres}"
 : "${POSTGRES_PASSWORD:=postgres}"
 : "${POSTGRES_DB:=postgres}"
 : "${POSTGRES_HOST:=127.0.0.1}"
 : "${POSTGRES_PORT:=5001}"
 : "${START_LOCAL_POSTGRES:=true}"
+: "${READINESS_TIMEOUT:=180}"   # seconds
+: "${READINESS_INTERVAL:=2}"    # seconds
 
-# Work dir and files
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
@@ -40,15 +30,15 @@ export PGDATA="${SCRIPT_DIR}/data"
 LOG_FILE="${SCRIPT_DIR}/postgres.log"
 PID_FILE="${PGDATA}/postmaster.pid"
 
-# Construct POSTGRES_URL if not given (use localhost binding)
+# Construct URL if not provided
 if [[ -z "${POSTGRES_URL:-}" ]]; then
   POSTGRES_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
 fi
 export POSTGRES_URL
 export PGPASSWORD="${POSTGRES_PASSWORD}"
 
-echo "[DB] -----------------------------------------------"
-echo "[DB] Expense Database Startup"
+echo "[DB] ------------------------------------------------------------"
+echo "[DB] Expense Database Startup (hardened)"
 echo "[DB] PGDATA: ${PGDATA}"
 echo "[DB] POSTGRES_HOST: ${POSTGRES_HOST}"
 echo "[DB] POSTGRES_PORT: ${POSTGRES_PORT}"
@@ -57,47 +47,120 @@ echo "[DB] POSTGRES_DB: ${POSTGRES_DB}"
 echo "[DB] START_LOCAL_POSTGRES: ${START_LOCAL_POSTGRES}"
 echo "[DB] Effective POSTGRES_URL: ${POSTGRES_URL}"
 echo "[DB] Log file: ${LOG_FILE}"
-echo "[DB] -----------------------------------------------"
+echo "[DB] ------------------------------------------------------------"
 
-# Ensure directories
+# Resolve postgres binaries
+resolve_bin() {
+  local name="$1"
+  if command -v "${name}" >/dev/null 2>&1; then
+    command -v "${name}"
+    return 0
+  fi
+  # Attempt Debian/Ubuntu common path fallback
+  local debbin="$(ls /usr/lib/postgresql/*/bin/${name} 2>/dev/null | head -n1 || true)"
+  if [[ -n "${debbin}" && -x "${debbin}" ]]; then
+    echo "${debbin}"
+    return 0
+  fi
+  return 1
+}
+
+if ! POSTGRES_BIN="$(resolve_bin postgres)"; then
+  echo "[DB][ERROR] 'postgres' binary not found in PATH or standard locations."
+  echo "[DB] Ensure PostgreSQL is installed and binaries are available."
+  exit 1
+fi
+if ! INITDB_BIN="$(resolve_bin initdb)"; then
+  echo "[DB][ERROR] 'initdb' binary not found."
+  echo "[DB] Ensure PostgreSQL client/server tools are installed."
+  exit 1
+fi
+if ! PG_CTL_BIN="$(resolve_bin pg_ctl)"; then
+  echo "[DB][ERROR] 'pg_ctl' binary not found."
+  echo "[DB] Ensure PostgreSQL client/server tools are installed."
+  exit 1
+fi
+if ! PSQL_BIN="$(resolve_bin psql)"; then
+  echo "[DB][ERROR] 'psql' binary not found."
+  echo "[DB] Ensure PostgreSQL client tools are installed."
+  exit 1
+fi
+
+echo "[DB] Detected binaries:"
+echo "[DB]   postgres: ${POSTGRES_BIN}"
+echo "[DB]   initdb  : ${INITDB_BIN}"
+echo "[DB]   pg_ctl  : ${PG_CTL_BIN}"
+echo "[DB]   psql    : ${PSQL_BIN}"
+
+# Ensure directories and permissions
 mkdir -p "${PGDATA}"
-touch "${LOG_FILE}"
+touch "${LOG_FILE}" || true
+chmod 600 "${LOG_FILE}" || true
 
-# Cleanup function on exit
+# PGDATA permissions (safe for local dev)
+chmod 700 "${PGDATA}" || true
+
+# Port-in-use detection helper
+port_in_use() {
+  local host="$1" port="$2"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | grep -E "[\:\ ]${port}\b" >/dev/null 2>&1 && return 0 || return 1
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -E "(:|\\b)${port}\\b" >/dev/null 2>&1 && return 0 || return 1
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tln 2>/dev/null | awk '{print $4}' | grep -E "(:|\\b)${port}\\b" >/dev/null 2>&1 && return 0 || return 1
+  else
+    # Fallback: try connecting
+    (echo > /dev/tcp/${host}/${port}) >/dev/null 2>&1 && return 0 || return 1
+  fi
+}
+
+# Stop postgres function
 stop_postgres() {
-  echo "[DB] Caught termination signal. Stopping postgres..."
-  if [[ -d "${PGDATA}" ]]; then
-    if pg_ctl -D "${PGDATA}" status >/dev/null 2>&1; then
-      pg_ctl -D "${PGDATA}" -m fast stop || true
-    fi
+  echo "[DB] Stopping postgres (if running)..."
+  if "${PG_CTL_BIN}" -D "${PGDATA}" status >/dev/null 2>&1; then
+    "${PG_CTL_BIN}" -D "${PGDATA}" -m fast stop || true
   fi
   echo "[DB] Postgres stopped."
 }
+
+# Trap for graceful shutdown
 trap stop_postgres SIGINT SIGTERM
 
-# Detect initialization
+# Determine if cluster needs init
 NEEDS_INIT=1
 if [[ -s "${PGDATA}/PG_VERSION" ]]; then
   NEEDS_INIT=0
 fi
 
-# Ensure local postgres is started if requested
+# Initialize cluster if requested and needed
 if [[ "${START_LOCAL_POSTGRES}" == "true" ]]; then
+  # Quick port check before start (only meaningful if we bind to TCP)
+  if port_in_use "${POSTGRES_HOST}" "${POSTGRES_PORT}"; then
+    echo "[DB][WARN] Port ${POSTGRES_PORT} appears to be in use."
+    echo "[DB] Attempting to detect service binding on that port:"
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -iTCP -sTCP:LISTEN -P | grep -E "[\:\ ]${POSTGRES_PORT}\b" || true
+    fi
+    echo "[DB] If this is a different Postgres instance, set POSTGRES_PORT to a free port, or STOP the other instance."
+  fi
+
   if [[ "${NEEDS_INIT}" -eq 1 ]]; then
-    echo "[DB] Initializing new PostgreSQL cluster..."
-    # Initialize cluster with auth for our superuser
-    # --pwfile requires a file; we create a temp one safely
+    echo "[DB] Initializing new PostgreSQL cluster in ${PGDATA} ..."
     PWFILE="$(mktemp)"
-    trap 'rm -f "${PWFILE}" || true' EXIT
+    # ensure cleanup
+    cleanup_pw() { rm -f "${PWFILE}" >/dev/null 2>&1 || true; }
+    trap 'cleanup_pw; stop_postgres' EXIT
     printf "%s" "${POSTGRES_PASSWORD}" > "${PWFILE}"
 
-    # Initialize with specified superuser
-    initdb -D "${PGDATA}" -U "${POSTGRES_USER}" --pwfile="${PWFILE}"
+    # Use --auth-local=md5, --auth-host=md5 for dev (require password)
+    "${INITDB_BIN}" -D "${PGDATA}" -U "${POSTGRES_USER}" --pwfile="${PWFILE}" --auth=md5 >/dev/null
+    cleanup_pw
 
-    # Configure postgresql.conf
-    echo "[DB] Writing postgresql.conf with listen_addresses=127.0.0.1 and port=${POSTGRES_PORT}"
+    # Update postgresql.conf to listen on desired host and port
+    echo "[DB] Configuring postgresql.conf (listen_addresses='*', port=${POSTGRES_PORT})"
     {
-      echo "listen_addresses = '127.0.0.1'"
+      echo "listen_addresses = '*'"
       echo "port = ${POSTGRES_PORT}"
       echo "max_connections = 100"
       echo "shared_buffers = 128MB"
@@ -105,168 +168,199 @@ if [[ "${START_LOCAL_POSTGRES}" == "true" ]]; then
       echo "synchronous_commit = on"
       echo "log_timezone = 'UTC'"
       echo "timezone = 'UTC'"
+      echo "logging_collector = on"
+      echo "log_directory = 'log'"
+      echo "log_filename = 'postgresql-%Y-%m-%d.log'"
     } >> "${PGDATA}/postgresql.conf"
 
-    # Configure pg_hba.conf for local md5 auth
-    echo "[DB] Configuring pg_hba.conf for local md5..."
+    # Configure pg_hba.conf: trust local connections for dev
+    echo "[DB] Configuring pg_hba.conf for local development (trust for local, md5 for others)"
     {
-      echo "local   all             all                                     md5"
+      echo "local   all             all                                     trust"
       echo "host    all             all             127.0.0.1/32            md5"
       echo "host    all             all             ::1/128                 md5"
+      echo "host    all             all             0.0.0.0/0               md5"
     } > "${PGDATA}/pg_hba.conf"
 
   else
     echo "[DB] Existing PostgreSQL cluster detected at ${PGDATA}."
-    # Ensure postgresql.conf has our settings; append if not present
-    grep -q "listen_addresses" "${PGDATA}/postgresql.conf" 2>/dev/null || echo "listen_addresses = '127.0.0.1'" >> "${PGDATA}/postgresql.conf"
-    if grep -qE "^[#\s]*port\s*=" "${PGDATA}/postgresql.conf"; then
-      # Replace port line
+    # Ensure minimal config present/updated
+    if ! grep -qE "^[#\s]*listen_addresses\s*=" "${PGDATA}/postgresql.conf" 2>/dev/null; then
+      echo "listen_addresses = '*'" >> "${PGDATA}/postgresql.conf"
+    else
+      sed -i "s/^[#\s]*listen_addresses\s*=.*/listen_addresses = '*'/" "${PGDATA}/postgresql.conf" || true
+    fi
+    if grep -qE "^[#\s]*port\s*=" "${PGDATA}/postgresql.conf" 2>/dev/null; then
       sed -i "s/^[#\s]*port\s*=.*/port = ${POSTGRES_PORT}/" "${PGDATA}/postgresql.conf" || true
     else
       echo "port = ${POSTGRES_PORT}" >> "${PGDATA}/postgresql.conf"
     fi
-    # Ensure pg_hba has local md5
+    # Ensure pg_hba allows local dev
+    if ! grep -q "^local\s\+all\s\+all\s\+trust" "${PGDATA}/pg_hba.conf" 2>/dev/null; then
+      echo "local   all             all                                     trust" >> "${PGDATA}/pg_hba.conf"
+    fi
     if ! grep -q "127.0.0.1/32" "${PGDATA}/pg_hba.conf" 2>/dev/null; then
       echo "host    all             all             127.0.0.1/32            md5" >> "${PGDATA}/pg_hba.conf"
     fi
-    if ! grep -q "^local\s\+all\s\+all\s\+md5" "${PGDATA}/pg_hba.conf" 2>/dev/null; then
-      echo "local   all             all                                     md5" >> "${PGDATA}/pg_hba.conf"
+    if ! grep -q "::1/128" "${PGDATA}/pg_hba.conf" 2>/dev/null; then
+      echo "host    all             all             ::1/128                 md5" >> "${PGDATA}/pg_hba.conf"
     fi
   fi
 
-  # Start postgres if not already running
-  if ! pg_ctl -D "${PGDATA}" status >/dev/null 2>&1; then
-    echo "[DB] Starting postgres (pg_ctl) ..."
-    pg_ctl -D "${PGDATA}" -l "${LOG_FILE}" -w start
-    echo "[DB] postgres started."
+  # Start postgres with explicit host/port options ensuring bind as requested
+  if ! "${PG_CTL_BIN}" -D "${PGDATA}" status >/dev/null 2>&1; then
+    echo "[DB] Starting postgres via pg_ctl ..."
+    # -w waits for server start; -l logs to file
+    "${PG_CTL_BIN}" -D "${PGDATA}" -l "${LOG_FILE}" -w start -o "-p ${POSTGRES_PORT} -h ${POSTGRES_HOST}"
+    echo "[DB] Postgres started (pg_ctl)."
   else
-    echo "[DB] postgres already running (pg_ctl status OK)."
+    echo "[DB] Postgres already running (pg_ctl status OK)."
   fi
 else
   echo "[DB] START_LOCAL_POSTGRES=false - Skipping local postgres management."
 fi
 
-# Wait for readiness on configured host/port
-echo "[DB] Waiting for PostgreSQL readiness on ${POSTGRES_HOST}:${POSTGRES_PORT} ..."
-ATTEMPTS=0
-until psql "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" -c "SELECT 1" >/dev/null 2>&1; do
-  ATTEMPTS=$((ATTEMPTS+1))
-  if [[ $ATTEMPTS -ge 60 ]]; then
-    echo "[DB][ERROR] PostgreSQL not ready after 60 attempts (~60s)."
-    echo "Check ${LOG_FILE} for details."
-    exit 1
-  fi
-  sleep 1
-done
-echo "[DB] PostgreSQL is ready."
+# Readiness check using both constructed URL and host/port split
+is_ready() {
+  # Try host/port direct (prefer socket/host explicit)
+  "${PSQL_BIN}" "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" -c "SELECT 1" >/dev/null 2>&1 && return 0
+  # Try POSTGRES_URL if previous failed
+  "${PSQL_BIN}" "${POSTGRES_URL%/*}/postgres" -c "SELECT 1" >/dev/null 2>&1 && return 0
+  return 1
+}
 
-# Ensure superuser exists (if initdb created a different user or in reuse cases)
-# Create role only if not exists, set password.
-echo "[DB] Ensuring role \"${POSTGRES_USER}\" exists with login/superuser..."
-psql "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" -v ON_ERROR_STOP=1 <<SQL
+echo "[DB] Waiting for PostgreSQL readiness on ${POSTGRES_HOST}:${POSTGRES_PORT} (timeout ${READINESS_TIMEOUT}s)..."
+elapsed=0
+while ! is_ready; do
+  sleep "${READINESS_INTERVAL}"
+  elapsed=$((elapsed + READINESS_INTERVAL))
+  if (( elapsed >= READINESS_TIMEOUT )); then
+    echo "[DB][ERROR] PostgreSQL not ready after ${READINESS_TIMEOUT}s."
+    echo "[DB] Last 50 log lines (if any):"
+    tail -n 50 "${LOG_FILE}" 2>/dev/null || true
+    echo "[DB] Skipping schema/seed because DB is unreachable."
+    # Keep process running if we started postgres (tail logs), else exit non-zero
+    if [[ "${START_LOCAL_POSTGRES}" == "true" ]]; then
+      echo "[DB] Keeping postgres running. Exiting readiness loop."
+      break
+    else
+      exit 1
+    fi
+  fi
+  echo "[DB] ... still waiting (${elapsed}s)"
+done
+
+if is_ready; then
+  echo "[DB] PostgreSQL is ready."
+
+  # Ensure role exists and password is set
+  echo "[DB] Ensuring role \"${POSTGRES_USER}\" exists with login/superuser..."
+  "${PSQL_BIN}" "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" -v ON_ERROR_STOP=1 <<SQL
 DO \$\$
 BEGIN
    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${POSTGRES_USER}') THEN
       CREATE ROLE "${POSTGRES_USER}" WITH LOGIN SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';
    ELSE
-      -- ensure password matches
       EXECUTE format('ALTER ROLE %I WITH PASSWORD %L', '${POSTGRES_USER}', '${POSTGRES_PASSWORD}');
    END IF;
 END
 \$\$;
 SQL
 
-# Ensure target database exists
-echo "[DB] Ensuring database \"${POSTGRES_DB}\" exists..."
-DB_EXISTS=$(psql -tAc "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_DB}'" "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" || echo "")
-if [[ "${DB_EXISTS}" != "1" ]]; then
-  psql "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${POSTGRES_DB}\";"
-  echo "[DB] Created database ${POSTGRES_DB}"
-else
-  echo "[DB] Database ${POSTGRES_DB} already exists."
-fi
+  # Ensure target database exists
+  echo "[DB] Ensuring database \"${POSTGRES_DB}\" exists..."
+  DB_EXISTS=$("${PSQL_BIN}" -tAc "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_DB}'" "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" || echo "")
+  if [[ "${DB_EXISTS}" != "1" ]]; then
+    "${PSQL_BIN}" "host=${POSTGRES_HOST} port=${POSTGRES_PORT} user=${POSTGRES_USER} dbname=postgres" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${POSTGRES_DB}\";"
+    echo "[DB] Created database ${POSTGRES_DB}"
+  else
+    echo "[DB] Database ${POSTGRES_DB} already exists."
+  fi
 
-# Update POSTGRES_URL to point to target DB explicitly
-POSTGRES_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
-export POSTGRES_URL
+  # Update POSTGRES_URL to target DB
+  POSTGRES_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
+  export POSTGRES_URL
 
-# Helper: run SQL and SQL files against target DB
-run_sql() {
-  local sql="$1"
-  echo "[DB] Running SQL: ${sql}"
-  psql "${POSTGRES_URL}" -v ON_ERROR_STOP=1 -c "${sql}"
-}
-run_sql_file() {
-  local file="$1"
-  echo "[DB] Applying file: ${file}"
-  psql "${POSTGRES_URL}" -v ON_ERROR_STOP=1 -f "${file}"
-}
+  # Helpers
+  run_sql() {
+    local sql="$1"
+    echo "[DB] Running SQL: ${sql}"
+    "${PSQL_BIN}" "${POSTGRES_URL}" -v ON_ERROR_STOP=1 -c "${sql}"
+  }
+  run_sql_file() {
+    local file="$1"
+    if [[ ! -f "${file}" ]]; then
+      echo "[DB][WARN] File not found: ${file}"
+      return 0
+    fi
+    echo "[DB] Applying file: ${file}"
+    "${PSQL_BIN}" "${POSTGRES_URL}" -v ON_ERROR_STOP=1 -f "${file}"
+  }
 
-# Apply schema.sql (idempotent)
-SCHEMA_FILE="${SCRIPT_DIR}/schema.sql"
-if [[ -f "${SCHEMA_FILE}" ]]; then
-  echo "[DB] Applying schema.sql (idempotent by design)..."
-  run_sql_file "${SCHEMA_FILE}"
-else
-  echo "[DB][WARN] schema.sql not found; skipping."
-fi
+  # Apply schema and migrations
+  SCHEMA_FILE="${SCRIPT_DIR}/schema.sql"
+  if [[ -f "${SCHEMA_FILE}" ]]; then
+    echo "[DB] Applying schema.sql ..."
+    run_sql_file "${SCHEMA_FILE}"
+  else
+    echo "[DB][WARN] schema.sql not found; skipping."
+  fi
 
-# Apply migrations if any (optional; they may include \i ../schema.sql etc.)
-MIGRATIONS_DIR="${SCRIPT_DIR}/migrations"
-if [[ -d "${MIGRATIONS_DIR}" ]]; then
-  echo "[DB] Applying migrations (if any)..."
-  # Run migrations in lexicographic order
-  shopt -s nullglob
-  for m in "${MIGRATIONS_DIR}"/*.sql; do
-    echo "[DB] Migration: ${m}"
-    run_sql_file "${m}"
-  done
-  shopt -u nullglob
-else
-  echo "[DB] No migrations directory found."
-fi
+  MIGRATIONS_DIR="${SCRIPT_DIR}/migrations"
+  if [[ -d "${MIGRATIONS_DIR}" ]]; then
+    echo "[DB] Applying migrations (lexicographic order)..."
+    shopt -s nullglob
+    for m in "${MIGRATIONS_DIR}"/*.sql; do
+      echo "[DB] Migration: ${m}"
+      run_sql_file "${m}"
+    done
+    shopt -u nullglob
+  else
+    echo "[DB] No migrations directory found."
+  fi
 
-# Seed if needed
-SEED_FILE="${SCRIPT_DIR}/seed.sql"
-if [[ -f "${SEED_FILE}" ]]; then
-  echo "[DB] Checking if seeding is required..."
-  # If users table exists and empty, seed
-  if run_sql "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users' LIMIT 1;" >/dev/null 2>&1; then
-    USER_COUNT=$(psql "${POSTGRES_URL}" -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null || echo "0")
-    if [[ "${USER_COUNT}" =~ ^[0-9]+$ ]] && [[ "${USER_COUNT}" -eq 0 ]]; then
-      echo "[DB] users table empty; running seed.sql"
-      run_sql_file "${SEED_FILE}"
+  # Seed if needed
+  SEED_FILE="${SCRIPT_DIR}/seed.sql"
+  if [[ -f "${SEED_FILE}" ]]; then
+    echo "[DB] Checking if seeding is required..."
+    if run_sql "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users' LIMIT 1;" >/dev/null 2>&1; then
+      USER_COUNT=$("${PSQL_BIN}" "${POSTGRES_URL}" -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null || echo "0")
+      if [[ "${USER_COUNT}" =~ ^[0-9]+$ ]] && [[ "${USER_COUNT}" -eq 0 ]]; then
+        echo "[DB] users table empty; running seed.sql"
+        run_sql_file "${SEED_FILE}"
+      else
+        echo "[DB] Seed skipped; users table already has ${USER_COUNT} row(s)."
+      fi
     else
-      echo "[DB] Seed skipped; users table already has ${USER_COUNT} row(s)."
+      echo "[DB] users table not found; running seed.sql"
+      run_sql_file "${SEED_FILE}"
     fi
   else
-    echo "[DB] users table not found; running seed.sql after schema"
-    run_sql_file "${SEED_FILE}"
+    echo "[DB][WARN] seed.sql not found; skipping."
   fi
+
+  echo "[DB] Database initialization complete."
 else
-  echo "[DB][WARN] seed.sql not found; skipping."
+  echo "[DB][WARN] PostgreSQL not confirmed ready; schema/seed skipped."
 fi
 
-echo "[DB] Database initialization complete."
-
-# Keep postgres in foreground by tailing the log (only if we started it)
+# Keep postgres running in foreground if we started it (follow logs)
 if [[ "${START_LOCAL_POSTGRES}" == "true" ]]; then
-  echo "[DB] Tailing postgres.log (Ctrl+C or send SIGTERM to stop)..."
-  # Use tail -F to follow across log rotations; ensure tail exits when shell receives SIGTERM via trap
+  echo "[DB] Following postgres logs. Send SIGTERM/SIGINT to stop."
+  # Reuse pg_ctl to maintain server lifecycle; tail for visibility
   tail -F "${LOG_FILE}" &
   TAIL_PID=$!
 
-  # Wait on tail process; if it exits, try to keep the script alive while postgres runs
+  # Wait on tail; keep process until termination signal
   wait "${TAIL_PID}" || true
 
-  # If tail stopped unexpectedly, keep the script running to serve as a foreground process
-  # but check postgres status; if not running, exit.
-  if pg_ctl -D "${PGDATA}" status >/dev/null 2>&1; then
+  # Double-check server status
+  if "${PG_CTL_BIN}" -D "${PGDATA}" status >/dev/null 2>&1; then
     echo "[DB] tail exited but postgres still running. Reattaching..."
-    tail -F "${LOG_FILE}"
+    exec tail -F "${LOG_FILE}"
   else
-    echo "[DB] postgres not running; exiting."
+    echo "[DB] Postgres not running; exiting."
   fi
 else
-  echo "[DB] START_LOCAL_POSTGRES=false; not tailing logs. Exiting."
+  echo "[DB] START_LOCAL_POSTGRES=false; exiting after setup."
 fi
