@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 161yR8MBp5DWlJEnseMiKmOW6KsfjfRHjwm1iXyQV9b6zH8ldB4jf4C7UtFgqcw
+\restrict ZsepYgTPbdyXpcMp0mGBIuj5RjYbrSsJzPhXi18Le6wvDxWp0KCQE6ygVEkmhZr
 
 -- Dumped from database version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
 -- Dumped by pg_dump version 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
@@ -28,9 +28,9 @@ CREATE DATABASE myapp WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDE
 
 ALTER DATABASE myapp OWNER TO postgres;
 
-\unrestrict 161yR8MBp5DWlJEnseMiKmOW6KsfjfRHjwm1iXyQV9b6zH8ldB4jf4C7UtFgqcw
+\unrestrict ZsepYgTPbdyXpcMp0mGBIuj5RjYbrSsJzPhXi18Le6wvDxWp0KCQE6ygVEkmhZr
 \connect myapp
-\restrict 161yR8MBp5DWlJEnseMiKmOW6KsfjfRHjwm1iXyQV9b6zH8ldB4jf4C7UtFgqcw
+\restrict ZsepYgTPbdyXpcMp0mGBIuj5RjYbrSsJzPhXi18Le6wvDxWp0KCQE6ygVEkmhZr
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -889,5 +889,5 @@ REFRESH MATERIALIZED VIEW public.mv_monthly_spend_by_category;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 161yR8MBp5DWlJEnseMiKmOW6KsfjfRHjwm1iXyQV9b6zH8ldB4jf4C7UtFgqcw
+\unrestrict ZsepYgTPbdyXpcMp0mGBIuj5RjYbrSsJzPhXi18Le6wvDxWp0KCQE6ygVEkmhZr
 
