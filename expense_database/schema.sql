@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, date DESC);
 CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(category_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
+CREATE INDEX IF NOT EXISTS idx_transactions_category_id ON transactions(category_id);
 
 -- Budgets
 CREATE TABLE IF NOT EXISTS budgets (
@@ -71,8 +73,12 @@ CREATE TABLE IF NOT EXISTS budgets (
     month DATE NOT NULL,
     amount NUMERIC(12,2) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    period TEXT DEFAULT 'monthly',
+    active BOOLEAN DEFAULT true,
     UNIQUE(user_id, category_id, month)
 );
+-- Helpful index for monthly lookups
+CREATE INDEX IF NOT EXISTS idx_budgets_user_month ON budgets(user_id, month);
 
 -- Goals
 CREATE TABLE IF NOT EXISTS goals (
@@ -82,6 +88,7 @@ CREATE TABLE IF NOT EXISTS goals (
     target_amount NUMERIC(12,2) NOT NULL,
     current_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
     target_date DATE,
+    due_date DATE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
